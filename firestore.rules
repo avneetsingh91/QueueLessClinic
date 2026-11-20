@@ -1,0 +1,169 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function currentUid() {
+      return request.auth.uid;
+    }
+
+    function ownUserExists() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(currentUid()));
+    }
+
+    function ownUserData() {
+      return get(/databases/$(database)/documents/users/$(currentUid())).data;
+    }
+
+    function staffOf(clinicId) {
+      return ownUserExists()
+        && ownUserData().clinicId == clinicId
+        && ownUserData().isActive == true;
+    }
+
+    function adminOf(clinicId) {
+      return staffOf(clinicId) && ownUserData().role == 'admin';
+    }
+
+    function ownUserExistsAfter() {
+      return signedIn() && existsAfter(/databases/$(database)/documents/users/$(currentUid()));
+    }
+
+    function staffOfAfter(clinicId) {
+      return ownUserExistsAfter()
+        && getAfter(/databases/$(database)/documents/users/$(currentUid())).data.clinicId == clinicId
+        && getAfter(/databases/$(database)/documents/users/$(currentUid())).data.isActive == true;
+    }
+
+    function clinicOwnedAfter(clinicId) {
+      return signedIn()
+        && existsAfter(/databases/$(database)/documents/clinics/$(clinicId))
+        && getAfter(/databases/$(database)/documents/clinics/$(clinicId)).data.ownerId == currentUid();
+    }
+
+    function validPublicQueueData() {
+      let data = request.resource.data;
+      return data.keys().hasOnly([
+          'clinicId', 'queueId', 'slug', 'clinicName', 'doctorName', 'department',
+          'queueDate', 'status', 'announcement', 'currentTokenNumber',
+          'currentServingTokenNumber', 'tokenSummaries', 'averageConsultationMinutes',
+          'updatedAt'
+        ])
+        && data.clinicId is string
+        && data.slug is string
+        && data.status in ['OPEN', 'PAUSED', 'CLOSED']
+        && data.tokenSummaries is list
+        && data.tokenSummaries.size() <= 1000;
+    }
+
+    // PUBLIC MIRROR: the only document patients can read.
+    // It contains token numbers and status only — never patient identity or medical data.
+    match /publicQueues/{slug} {
+      allow read: if true;
+      allow create: if signedIn()
+        && validPublicQueueData()
+        && clinicOwnedAfter(request.resource.data.clinicId);
+      allow update: if staffOf(resource.data.clinicId)
+        && validPublicQueueData()
+        && request.resource.data.clinicId == resource.data.clinicId
+        && request.resource.data.slug == slug;
+      allow delete: if false;
+    }
+
+    match /clinics/{clinicId} {
+      allow read: if signedIn() && staffOf(clinicId);
+      allow create: if signedIn()
+        && request.resource.data.ownerId == currentUid()
+        && request.resource.data.isActive == true
+        && request.resource.data.publicSlug is string;
+      allow update: if adminOf(clinicId)
+        && request.resource.data.ownerId == resource.data.ownerId
+        && request.resource.data.publicSlug == resource.data.publicSlug;
+      allow delete: if false;
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn()
+        && (userId == currentUid() || (ownUserExists() && staffOf(resource.data.clinicId)));
+      allow create: if signedIn()
+        && userId == currentUid()
+        && request.resource.data.clinicId is string
+        && request.resource.data.role in ['admin', 'receptionist']
+        && request.resource.data.isActive == true
+        && clinicOwnedAfter(request.resource.data.clinicId);
+      allow update: if signedIn()
+        && (
+          (userId == currentUid()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'updatedAt']))
+          ||
+          (adminOf(resource.data.clinicId)
+            && request.resource.data.clinicId == resource.data.clinicId
+            && request.resource.data.role in ['admin', 'receptionist'])
+        );
+      allow delete: if false;
+    }
+
+    match /queues/{queueId} {
+      allow read: if signedIn() && staffOf(resource.data.clinicId);
+      allow create: if signedIn()
+        && staffOfAfter(request.resource.data.clinicId)
+        && request.resource.data.clinicId is string;
+      allow update: if signedIn()
+        && staffOf(resource.data.clinicId)
+        && request.resource.data.clinicId == resource.data.clinicId
+        && request.resource.data.queueDate == resource.data.queueDate
+        && request.resource.data.currentTokenNumber is int
+        && request.resource.data.currentTokenNumber >= 0
+        && request.resource.data.status in ['OPEN', 'PAUSED', 'CLOSED']
+        && request.resource.data.averageConsultationMinutes is number
+        && request.resource.data.tokenSummaries is list;
+      allow delete: if false;
+
+      match /tokens/{tokenId} {
+        allow read: if signedIn()
+          && staffOf(get(/databases/$(database)/documents/queues/$(queueId)).data.clinicId);
+        allow create: if signedIn()
+          && staffOf(get(/databases/$(database)/documents/queues/$(queueId)).data.clinicId)
+          && request.resource.data.clinicId == get(/databases/$(database)/documents/queues/$(queueId)).data.clinicId
+          && request.resource.data.queueId == queueId
+          && request.resource.data.status == 'WAITING';
+        allow update: if signedIn()
+          && staffOf(get(/databases/$(database)/documents/queues/$(queueId)).data.clinicId)
+          && request.resource.data.tokenNumber == resource.data.tokenNumber
+          && request.resource.data.status in ['WAITING', 'SERVING', 'COMPLETED', 'SKIPPED', 'CANCELLED'];
+        allow delete: if signedIn()
+          && staffOf(get(/databases/$(database)/documents/queues/$(queueId)).data.clinicId);
+      }
+    }
+
+    match /queueEvents/{eventId} {
+      allow read: if signedIn() && staffOf(resource.data.clinicId);
+      allow create: if signedIn()
+        && request.resource.data.clinicId is string
+        && request.resource.data.performedBy == currentUid()
+        && (staffOf(request.resource.data.clinicId) || staffOfAfter(request.resource.data.clinicId));
+      allow update: if signedIn()
+        && staffOf(resource.data.clinicId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['undone', 'undoneAt', 'undoneBy']);
+      allow delete: if false;
+    }
+
+    match /doctors/{doctorId} {
+      allow read: if signedIn() && staffOf(resource.data.clinicId);
+      allow create: if signedIn()
+        && staffOf(request.resource.data.clinicId)
+        && request.resource.data.clinicId is string;
+      allow update: if signedIn()
+        && adminOf(resource.data.clinicId)
+        && request.resource.data.clinicId == resource.data.clinicId;
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
